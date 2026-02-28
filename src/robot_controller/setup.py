@@ -24,6 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            "test_node = robot_controller.my_first_node:main"
+            #node name = "package"."filename":"function"        
         ],
     },
 )
