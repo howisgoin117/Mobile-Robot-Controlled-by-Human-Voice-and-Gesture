@@ -2,7 +2,6 @@ build/
 install/
 log/
 captures/
-Dockerfile
 robot_commands.csv
 voice_commands.csv
 .vscode/
