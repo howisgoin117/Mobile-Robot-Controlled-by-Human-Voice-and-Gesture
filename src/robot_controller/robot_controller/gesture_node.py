@@ -8,6 +8,8 @@ import os
 import numpy as np
 import mediapipe as mp
 import csv
+import time
+import math
 from datetime import datetime
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -39,6 +41,10 @@ def is_extended_inversed(lm, tip, pip):
 
 def hand_scale(lm):
     return dist(lm[0], lm[9])   # wrist -> middle MCP
+
+def calculate_pixel_distance(p1, p2):
+    """Euclidean distance between two (x, y) pixel coordinate tuples."""
+    return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
 # Gesture definitions
 def gesture_backward(lm):
@@ -84,13 +90,9 @@ def gesture_fist(lm):
     )    
 
 def gesture_ok(lm):
-    """OK sign on left hand"""
-    return(
-        is_extended(lm, 20, 18) and
-        is_extended(lm, 16, 15) and
-        is_extended(lm, 12, 11) and 
-        angle(lm[5], lm[6], lm[7]) < 120
-    )
+    return(is_extended(lm, 20, 18) and is_extended(lm, 16, 15) and
+           is_extended(lm, 12, 11) and angle(lm[5], lm[6], lm[7]) < 120 and
+           angle(lm[17], lm[18], lm[19]) > 150 and angle(lm[13], lm[14], lm[15]) > 150)
 
 
 def gesture_forward(lm):
@@ -123,23 +125,19 @@ def gesture_move_right(lm):
 
 #command data logger
 previous_command = None
-def log_command(command_name, filepath="robot_commands.csv"):
+def log_command(command_name, fps, inference_time, filepath="robot_commands.csv"):
     """
-    Appends a timestamp and the command name to a CSV file.
+    Appends a timestamp, command name, FPS, and inference time to a CSV file.
     Creates the file if it doesn't exist.
     """
-    # Get the exact current time
     now = datetime.now()
-    # Format: YYYY-MM-DD HH:MM:SS
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
     
-    # Open the CSV in 'append' mode ('a') so we don't overwrite old data
     with open(filepath, mode='a', newline='') as file:
         writer = csv.writer(file)
-        # Write a single row: [Time, Command]
-        writer.writerow([timestamp, command_name])
+        writer.writerow([timestamp, command_name, f"{fps:.1f}", f"{inference_time:.1f}"])
         
-    print(f"Logged: {command_name} at {timestamp}")
+    print(f"Logged: {command_name} at {timestamp} | FPS: {fps:.1f} | Inference: {inference_time:.1f}ms")
 
 # Create folder to save captures
 CAPTURE_DIR = "captures"
@@ -186,31 +184,55 @@ class GestureNode(Node):
         # Derive model path relative to this script so it works regardless of
         # where the workspace is mounted (e.g. /ros2_ws inside Docker).
         _script_dir = os.path.dirname(os.path.abspath(__file__))
-        _default_model = os.path.join(_script_dir, 'model', 'hand_landmarker.task')
-        model_path = self.declare_parameter('model_path', _default_model).value
 
-        if not os.path.isfile(model_path):
+        # --- HAND MODEL ---
+        _default_hand_model = os.path.join(_script_dir, 'model', 'hand_landmarker.task')
+        hand_model_path = self.declare_parameter('model_path', _default_hand_model).value
+
+        if not os.path.isfile(hand_model_path):
             self.get_logger().fatal(
-                f'Hand-landmarker model not found at: {model_path}\n'
+                f'Hand-landmarker model not found at: {hand_model_path}\n'
                 'Set the "model_path" parameter or verify the file exists.')
-            raise FileNotFoundError(f'Model not found: {model_path}')
+            raise FileNotFoundError(f'Model not found: {hand_model_path}')
 
-        self.get_logger().info(f'Loading model from: {model_path}')
-        base_options = python.BaseOptions(model_asset_path=model_path)
-        options = vision.HandLandmarkerOptions(
-            base_options=base_options,
-            running_mode=vision.RunningMode.IMAGE, # Using IMAGE mode for synchronous frame processing
-            num_hands=2,
-            min_hand_detection_confidence=0.7,
-            min_hand_presence_confidence=0.7,
-            min_tracking_confidence=0.7
+        self.get_logger().info(f'Loading hand model from: {hand_model_path}')
+        hand_base_options = python.BaseOptions(model_asset_path=hand_model_path)
+        hand_options = vision.HandLandmarkerOptions(
+            base_options=hand_base_options,
+            running_mode=vision.RunningMode.IMAGE,
+            num_hands=6,  # High limit to catch all background hands for filtering
+            min_hand_detection_confidence=0.6,
+            min_tracking_confidence=0.6
         )
-        # Create the landmarker engine
-        self.landmarker = vision.HandLandmarker.create_from_options(options)
+        self.hand_landmarker = vision.HandLandmarker.create_from_options(hand_options)
+
+        # --- POSE MODEL ---
+        _default_pose_model = os.path.join(_script_dir, 'model', 'pose_landmarker_lite.task')
+        pose_model_path = self.declare_parameter('pose_model_path', _default_pose_model).value
+
+        if not os.path.isfile(pose_model_path):
+            self.get_logger().fatal(
+                f'Pose-landmarker model not found at: {pose_model_path}\n'
+                'Set the "pose_model_path" parameter or verify the file exists.')
+            raise FileNotFoundError(f'Model not found: {pose_model_path}')
+
+        self.get_logger().info(f'Loading pose model from: {pose_model_path}')
+        pose_base_options = python.BaseOptions(model_asset_path=pose_model_path)
+        pose_options = vision.PoseLandmarkerOptions(
+            base_options=pose_base_options,
+            running_mode=vision.RunningMode.IMAGE,
+            min_pose_detection_confidence=0.6,
+            min_tracking_confidence=0.6
+        )
+        self.pose_landmarker = vision.PoseLandmarker.create_from_options(pose_options)
         
         # Drawing utilities
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_hands = mp.solutions.hands
+        self.mp_pose = mp.solutions.pose
+
+        # Distance threshold (pixels) between Hand Wrist and Body Wrist
+        self.MATCH_THRESHOLD = 100
         
         # 3. CAMERA SETUP — auto-detect a working camera
         camera_index = self.declare_parameter(
@@ -231,12 +253,23 @@ class GestureNode(Node):
             self.get_logger().warn(
                 'No display detected — will save annotated output to '
                 'gesture_output.avi instead of showing a GUI window.')
+
+        # 6. FPS & INFERENCE TRACKING
+        self.prev_frame_time = 0
+        self.fps = 0.0
+        self.inference_time_ms = 0.0
+
+        # 7. POSE STATE — persisted between frames for asymmetric frame skipping
+        self.frame_counter = 0
+        self.saved_pose_landmarks = None
+        self.user_left_wrist = None
+        self.user_right_wrist = None
             
-        # 6. THE TIMER (Replaces the while loop)
+        # 8. THE TIMER (Replaces the while loop)
         # 0.05 seconds = 20 Frames Per Second
         self.timer = self.create_timer(0.05, self.timer_callback)
 
-        # 7. WAKE STATE
+        # 9. WAKE STATE
         self.standalone = self.declare_parameter('standalone', False).value
         if self.standalone:
             self.is_awake = True
@@ -245,7 +278,7 @@ class GestureNode(Node):
             self.is_awake = False
             self.create_subscription(Bool, '/is_awake', self._on_awake, 10)
 
-        # 8. CAMERA SLEEP TOGGLE
+        # 10. CAMERA SLEEP TOGGLE
         # When True, camera processing pauses during sleep to save CPU.
         # When False, camera & detection keep running but commands are not published.
         self.camera_sleep_when_idle = self.declare_parameter(
@@ -310,60 +343,125 @@ class GestureNode(Node):
             return
 
         frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        results = self.landmarker.detect(mp_image)
-        
+
+        # ── FPS Calculation ──────────────────────────────────────────────
+        new_frame_time = time.time()
+        self.fps = 1 / (new_frame_time - self.prev_frame_time) if self.prev_frame_time > 0 else 0
+        self.prev_frame_time = new_frame_time
+
+        start_inference = time.time()
+
+        # ── 1. ALWAYS Run Hand Model (Fast) ──────────────────────────────
+        hand_results = self.hand_landmarker.detect(mp_image)
+
+        # ── 2. ASYMMETRIC FRAME SKIPPING: Run Pose Model every 5 frames ─
+        self.frame_counter += 1
+        if self.frame_counter % 5 == 0:
+            pose_results = self.pose_landmarker.detect(mp_image)
+
+            # Update saved pose data if a body is detected
+            if pose_results.pose_landmarks:
+                self.saved_pose_landmarks = pose_results.pose_landmarks[0]
+                lm15 = self.saved_pose_landmarks[15]  # Left Wrist
+                lm16 = self.saved_pose_landmarks[16]  # Right Wrist
+
+                self.user_left_wrist = (int(lm15.x * w), int(lm15.y * h)) if lm15.visibility > 0.5 else None
+                self.user_right_wrist = (int(lm16.x * w), int(lm16.y * h)) if lm16.visibility > 0.5 else None
+            else:
+                self.saved_pose_landmarks = None
+                self.user_left_wrist = None
+                self.user_right_wrist = None
+
+        self.inference_time_ms = (time.time() - start_inference) * 1000
+
         current_command = None
+        user_hand_landmarks = []
 
-        # 3. APPLYING HEURISTICS
+        # ── 3. DRAW THE POSE SKELETON ────────────────────────────────────
+        if self.saved_pose_landmarks:
+            pose_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
+            pose_landmarks_proto.landmark.extend([
+                landmark_pb2.NormalizedLandmark(x=pt.x, y=pt.y, z=pt.z)
+                for pt in self.saved_pose_landmarks
+            ])
+            self.mp_drawing.draw_landmarks(
+                frame,
+                pose_landmarks_proto,
+                self.mp_pose.POSE_CONNECTIONS,
+                self.mp_drawing.DrawingSpec(color=(245, 117, 66), thickness=2, circle_radius=2),
+                self.mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=2)
+            )
 
-        if results.hand_landmarks:
+        # ── 4. FILTERING: ISOLATE THE USER'S HANDS ──────────────────────
+        if hand_results.hand_landmarks:
+            for hand_lms in hand_results.hand_landmarks:
+                hand_wrist_px = (int(hand_lms[0].x * w), int(hand_lms[0].y * h))
+                is_users_hand = False
+
+                if self.user_left_wrist and calculate_pixel_distance(hand_wrist_px, self.user_left_wrist) < self.MATCH_THRESHOLD:
+                    is_users_hand = True
+                elif self.user_right_wrist and calculate_pixel_distance(hand_wrist_px, self.user_right_wrist) < self.MATCH_THRESHOLD:
+                    is_users_hand = True
+
+                if is_users_hand:
+                    user_hand_landmarks.append(hand_lms)
+
+                    # Draw the valid hands
+                    hand_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
+                    hand_landmarks_proto.landmark.extend([
+                        landmark_pb2.NormalizedLandmark(x=pt.x, y=pt.y, z=pt.z)
+                        for pt in hand_lms
+                    ])
+                    self.mp_drawing.draw_landmarks(frame, hand_landmarks_proto, self.mp_hands.HAND_CONNECTIONS)
+                else:
+                    cv2.putText(frame, "IGNORED", hand_wrist_px,
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+
+        # ── 5. APPLYING HEURISTICS ───────────────────────────────────────
+        if user_hand_landmarks:
             stop_detected = False
 
-            for hand_landmarks in results.hand_landmarks:
-                # ** NEW: We must convert the raw list into a protobuf to use the drawing utility **
-                hand_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
-                hand_landmarks_proto.landmark.extend([
-                    landmark_pb2.NormalizedLandmark(x=landmark.x, y=landmark.y, z=landmark.z) 
-                    for landmark in hand_landmarks
-                ])
-                self.mp_drawing.draw_landmarks(frame, hand_landmarks_proto, self.mp_hands.HAND_CONNECTIONS)
-                
-                # ** NEW: hand_landmarks is already the list of 21 points, no need to add .landmark **
-                lm = hand_landmarks
-                
+            for lm in user_hand_landmarks:
                 if classify_one_hand(lm) == "stop":
                     stop_detected = True
-                    break   
+                    break
 
             # GLOBAL SAFETY OVERRIDE
             if stop_detected:
                 current_command = "stop"
-                cv2.putText(frame, "Gesture: EMERGENCY STOP", (20, 50), 
+                cv2.putText(frame, "Gesture: EMERGENCY STOP", (20, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-            
+
             # STANDARD COMMAND LOGIC
             else:
-                num_hands = len(results.hand_landmarks)
-                
-                if num_hands == 2:
-                    lm1 = results.hand_landmarks[0]   
-                    lm2 = results.hand_landmarks[1]    
+                num_valid_hands = len(user_hand_landmarks)
+
+                if num_valid_hands >= 2:
+                    lm1 = user_hand_landmarks[0]
+                    lm2 = user_hand_landmarks[1]
 
                     current_command = classify_two_hands(lm1, lm2)
+                    is_ok_present = gesture_ok(lm1) or gesture_ok(lm2)
 
-                    if current_command:
-                        cv2.putText(frame, f"Gesture: {current_command.upper()}", (20, 50), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+                    if is_ok_present:
+                        if current_command:
+                            cv2.putText(frame, f"Gesture: {current_command.upper()}", (20, 50),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+                        else:
+                            cv2.putText(frame, "Waiting for valid combo...", (20, 50),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
                     else:
-                        cv2.putText(frame, "Waiting for valid combo...", (20, 50), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-                        
-                elif num_hands == 1:
-                    cv2.putText(frame, "Bring up second hand", (20, 50), 
+                        cv2.putText(frame, "Requires OK confirmation", (20, 50),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)
+
+                elif num_valid_hands == 1:
+                    cv2.putText(frame, "Bring up second hand", (20, 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)
-        # 4. LOGGING, CAPTURING, AND PUBLISHING
+
+        # ── 6. LOGGING, CAPTURING, AND PUBLISHING ────────────────────────
         if current_command is not None and current_command != self.previous_command:
             
             # Only publish if robot is awake
@@ -384,10 +482,9 @@ class GestureNode(Node):
             self.get_logger().info(f"Published command: {current_command}")
             
             # Log and Capture locally
-            log_command(current_command)
+            log_command(current_command, self.fps, self.inference_time_ms)
             
             #picture capturing
-            
             safe_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"{self.CAPTURE_DIR}/{current_command}_{safe_time}.jpg"
             cv2.imwrite(filename, frame)
@@ -397,7 +494,13 @@ class GestureNode(Node):
         elif current_command is None:
             self.previous_command = None        
 
-        # 5. OUTPUT — GUI window or video file
+        # ── 7. DISPLAY METRICS ───────────────────────────────────────────
+        cv2.putText(frame, f"FPS: {int(self.fps)}", (20, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+        cv2.putText(frame, f"Inference: {int(self.inference_time_ms)} ms", (20, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+
+        # ── 8. OUTPUT — GUI window or video file ─────────────────────────
         if self.gui_available:
             cv2.imshow('Hand Gesture Recognition', frame)
             cv2.waitKey(1)
@@ -436,7 +539,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
-
-
-
