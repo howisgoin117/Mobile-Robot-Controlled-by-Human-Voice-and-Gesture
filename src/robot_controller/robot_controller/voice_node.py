@@ -18,6 +18,7 @@ VOICE_MAP = {
     "right":    "right",    "turn right": "right",
     "stop":     "stop",     "halt":    "stop",       "pause":   "stop",
     "standby":  "standby",  "wait":    "standby",
+    "sleep":    "sleep",    "go to sleep": "sleep",
     "tom":      "wake_word", "hey tom": "wake_word", "hey, tom": "wake_word", 
     "hey top": "wake_word", "hey, todd": "wake_word", "start": "wake_word",
 }
@@ -122,9 +123,9 @@ class VoiceNode(Node):
             if phrase in text:
                 command = VOICE_MAP[phrase]
 
-                # Gate: wake_word always passes through;
+                # Gate: wake_word and sleep always pass through;
                 # other commands only when awake
-                if command != 'wake_word' and not self.is_awake:
+                if command not in ('wake_word', 'sleep') and not self.is_awake:
                     self.get_logger().debug(
                         f'Ignored "{text}" — sleeping (say wake word first)')
                     return

@@ -16,9 +16,9 @@ from mediapipe.tasks.python import vision
 from mediapipe.framework.formats import landmark_pb2
 
 
-# Camera index — can be overridden via ROS parameter 'camera_index'
-DEFAULT_CAMERA_INDEX = 0
-MAX_CAMERA_SCAN      = 5   # how many /dev/video indices to try
+# Camera index
+DEFAULT_CAMERA_INDEX = '/dev/amr_camera'
+MAX_CAMERA_SCAN      = 5   
 
 
 # 1.HEURISTIC FUNCTIONS
@@ -462,8 +462,7 @@ class GestureNode(Node):
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)
 
         # ── 6. LOGGING, CAPTURING, AND PUBLISHING ────────────────────────
-        if current_command is not None and current_command != self.previous_command:
-            
+        if current_command is not None:
             # Only publish if robot is awake
             if not self.is_awake:
                 self.get_logger().debug(
@@ -471,7 +470,8 @@ class GestureNode(Node):
                 self.previous_command = current_command
                 return
 
-            #PUBLISH TO ROS 2 **
+            # PUBLISH TO ROS 2 — send EVERY frame so the arbiter watchdog
+            # knows the gesture is still active (continuous movement).
             msg = String()
             msg.data = json.dumps({
                 "source": "gesture",
@@ -479,20 +479,20 @@ class GestureNode(Node):
                 "confidence": 1.0,
             })
             self.command_publisher.publish(msg)
-            self.get_logger().info(f"Published command: {current_command}")
-            
-            # Log and Capture locally
-            log_command(current_command, self.fps, self.inference_time_ms)
-            
-            #picture capturing
-            safe_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{self.CAPTURE_DIR}/{current_command}_{safe_time}.jpg"
-            cv2.imwrite(filename, frame)
-            
-            self.previous_command = current_command    
-            
+
+            # Log, capture, and info-log only on CHANGE to avoid spam
+            if current_command != self.previous_command:
+                self.get_logger().info(f"Published command: {current_command}")
+                log_command(current_command, self.fps, self.inference_time_ms)
+
+                safe_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{self.CAPTURE_DIR}/{current_command}_{safe_time}.jpg"
+                cv2.imwrite(filename, frame)
+
+            self.previous_command = current_command
+
         elif current_command is None:
-            self.previous_command = None        
+            self.previous_command = None
 
         # ── 7. DISPLAY METRICS ───────────────────────────────────────────
         cv2.putText(frame, f"FPS: {int(self.fps)}", (20, 100),

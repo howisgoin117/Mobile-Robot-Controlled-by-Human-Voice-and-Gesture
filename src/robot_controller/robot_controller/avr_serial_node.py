@@ -19,7 +19,7 @@ from rcl_interfaces.msg import SetParametersResult
 
 
 # ── Tuning (must match Arduino FIXED_VEL / STEER_RATIO) ───────────────────────
-FIXED_VEL   = 0.5           # matches Arduino FIXED_VEL
+FIXED_VEL   = 0.2           # matches Arduino FIXED_VEL
 STEER_RATIO = 0.30          # fraction of FIXED_VEL used for steering
 CONNECTION_CHECK_INTERVAL = 2.0
 
@@ -314,8 +314,10 @@ class AVRSerialNode(Node):
             # Movement commands → velocity protocol
             "forward":  f"v  {v:.2f}  0.00",
             "backward": f"v -{v:.2f}  0.00",
-            "left":     f"v  {v:.2f} -{s:.2f}",
-            "right":    f"v  {v:.2f}  {s:.2f}",
+#            "left":     f"v  {v:.2f} -{s:.2f}",
+            "left":     "tl",
+            "right":     "tr",
+#            "right":    f"v  {v:.2f}  {s:.2f}",
             # Stop commands → soft brake (keeps motors enabled!)
             "stop":     "stop",
             "standby":  "stop",
