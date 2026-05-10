@@ -15,8 +15,12 @@ docker run -it --rm \
   --device=/dev/ttyACM0:/dev/ttyACM0 \
   --device=/dev/ttyACM1:/dev/ttyACM1 \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v /run/user/$(id -u)/pulse:/run/user/$(id -u)/pulse \
+  -v ~/.config/pulse/cookie:/root/.config/pulse/cookie:ro \
+  -e PULSE_SERVER=unix:/run/user/$(id -u)/pulse/native \
   -v /home/manh/ros2_workspace:/ros2_ws \
   -e DISPLAY=$DISPLAY \
   -w /ros2_ws \
   my_robot_env \
   bash -c "source install/setup.bash && ros2 launch robot_controller bringup.launch.py"
+

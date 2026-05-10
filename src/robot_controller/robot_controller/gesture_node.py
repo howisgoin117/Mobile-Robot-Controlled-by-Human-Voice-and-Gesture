@@ -16,9 +16,9 @@ from mediapipe.tasks.python import vision
 from mediapipe.framework.formats import landmark_pb2
 
 
-# Camera index
+# Camera index — can be overridden via ROS parameter 'camera_index'
 DEFAULT_CAMERA_INDEX = '/dev/amr_camera'
-MAX_CAMERA_SCAN      = 5   
+MAX_CAMERA_SCAN      = 5   # how many /dev/video indices to try
 
 
 # 1.HEURISTIC FUNCTIONS
@@ -238,6 +238,10 @@ class GestureNode(Node):
         camera_index = self.declare_parameter(
             'camera_index', DEFAULT_CAMERA_INDEX
         ).value
+        # If it looks like a digit, cast to int
+        if isinstance(camera_index, str) and camera_index.isdigit():
+            camera_index = int(camera_index)
+            
         self.cap = self._open_camera(camera_index)
         
         # 4. STATE TRACKER
@@ -286,10 +290,10 @@ class GestureNode(Node):
         ).value
 
     # ── Camera helpers ───────────────────────────────────────────────────
-    def _open_camera(self, preferred_index: int) -> cv2.VideoCapture:
+    def _open_camera(self, preferred_index) -> cv2.VideoCapture:
         """Try preferred index first, then scan 0..MAX_CAMERA_SCAN-1."""
         indices_to_try = [preferred_index] + [
-            i for i in range(MAX_CAMERA_SCAN) if i != preferred_index
+            i for i in range(MAX_CAMERA_SCAN) if str(i) != str(preferred_index)
         ]
         for idx in indices_to_try:
             cap = cv2.VideoCapture(idx)
@@ -463,36 +467,36 @@ class GestureNode(Node):
 
         # ── 6. LOGGING, CAPTURING, AND PUBLISHING ────────────────────────
         if current_command is not None:
+            
             # Only publish if robot is awake
             if not self.is_awake:
-                self.get_logger().debug(
-                    f'Ignored gesture "{current_command}" — robot is sleeping')
-                self.previous_command = current_command
-                return
-
-            # PUBLISH TO ROS 2 — send EVERY frame so the arbiter watchdog
-            # knows the gesture is still active (continuous movement).
-            msg = String()
-            msg.data = json.dumps({
-                "source": "gesture",
-                "command": current_command,
-                "confidence": 1.0,
-            })
-            self.command_publisher.publish(msg)
-
-            # Log, capture, and info-log only on CHANGE to avoid spam
-            if current_command != self.previous_command:
-                self.get_logger().info(f"Published command: {current_command}")
-                log_command(current_command, self.fps, self.inference_time_ms)
-
-                safe_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"{self.CAPTURE_DIR}/{current_command}_{safe_time}.jpg"
-                cv2.imwrite(filename, frame)
-
-            self.previous_command = current_command
-
+                if current_command != self.previous_command:
+                    self.get_logger().debug(
+                        f'Ignored gesture "{current_command}" — robot is sleeping')
+            else:
+                #PUBLISH TO ROS 2 ** (CONTINUOUSLY)
+                msg = String()
+                msg.data = json.dumps({
+                    "source": "gesture",
+                    "command": current_command,
+                    "confidence": 1.0,
+                })
+                self.command_publisher.publish(msg)
+                
+                # Only log and capture locally if the command changes
+                if current_command != self.previous_command:
+                    self.get_logger().info(f"Published command: {current_command}")
+                    log_command(current_command, self.fps, self.inference_time_ms)
+                    
+                    #picture capturing
+                    safe_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"{self.CAPTURE_DIR}/{current_command}_{safe_time}.jpg"
+                    cv2.imwrite(filename, frame)
+            
+            self.previous_command = current_command    
+            
         elif current_command is None:
-            self.previous_command = None
+            self.previous_command = None        
 
         # ── 7. DISPLAY METRICS ───────────────────────────────────────────
         cv2.putText(frame, f"FPS: {int(self.fps)}", (20, 100),

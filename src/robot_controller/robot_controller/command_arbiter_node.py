@@ -56,33 +56,29 @@ class CommandArbiterNode(Node):
 
     # ── Callbacks ──────────────────────────────────────────────────────────
     def _on_voice(self, msg: String):
-        self.get_logger().info(f'[DEBUG] Raw voice msg received: {msg.data}')
+        self.get_logger().debug(f'[DEBUG] Raw voice msg received: {msg.data}')
         try:
             data = json.loads(msg.data)
         except json.JSONDecodeError as e:
             self.get_logger().error(f'[DEBUG] Failed to parse voice JSON: {e}')
             return
         command = data.get('command', '')
-        self.get_logger().info(
+        self.get_logger().debug(
             f'[DEBUG] Voice parsed — command="{command}"  awake={self.is_awake}')
 
         if command == 'wake_word':
             self._wake_up()
             return                      # don't dispatch wake_word as a motor cmd
 
-        if command == 'sleep':
-            self._go_to_sleep('voice "sleep" command received')
-            return                      # instantly sleep, no motor dispatch
-
         # Voice always overrides gesture (higher priority)
         if self.is_awake:
             self._dispatch(command, source='voice')
         else:
-            self.get_logger().info(
+            self.get_logger().debug(
                 f'Ignored voice "{command}" — robot is sleeping')
 
     def _on_gesture(self, msg: String):
-        self.get_logger().info(f'[DEBUG] Raw gesture msg received: {msg.data}')
+        self.get_logger().debug(f'[DEBUG] Raw gesture msg received: {msg.data}')
         try:
             data = json.loads(msg.data)
         except json.JSONDecodeError as e:
@@ -90,12 +86,12 @@ class CommandArbiterNode(Node):
             return
         command = data.get('command', '')
         confidence = data.get('confidence', 0)
-        self.get_logger().info(
+        self.get_logger().debug(
             f'[DEBUG] Gesture parsed — command="{command}"  '
             f'confidence={confidence}  awake={self.is_awake}')
 
         if not self.is_awake:
-            self.get_logger().info(
+            self.get_logger().debug(
                 f'Ignored gesture "{command}" — robot is sleeping')
             return
 
@@ -109,25 +105,29 @@ class CommandArbiterNode(Node):
 
     # ── Command dispatch ───────────────────────────────────────────────────
     def _dispatch(self, command: str, source: str):
+        command_changed = (command != self.last_command)
+        
         self.last_command  = command
         self.last_received = time.time()
-        self.dispatch_seq += 1
-
+        
         # Reset the wake timeout on every accepted command
         self.awake_deadline = time.time() + WAKE_TIMEOUT
 
         self.cmd_pub.publish(String(data=command))
-        remaining = self.awake_deadline - time.time()
-        self.get_logger().info(
-            f'[DISPATCH #{self.dispatch_seq}] [{source}] → "{command}"  '
-            f'(wake window: {remaining:.1f}s remaining)')
-        self.get_logger().info(
-            f'[TX→AVR #{self.dispatch_seq}] Sent "{command}" to '
-            f'/robot/command for avr_serial_node')
+        
+        if command_changed:
+            self.dispatch_seq += 1
+            remaining = self.awake_deadline - time.time()
+            self.get_logger().info(
+                f'[DISPATCH #{self.dispatch_seq}] [{source}] → "{command}"  '
+                f'(wake window: {remaining:.1f}s remaining)')
+            self.get_logger().info(
+                f'[TX→AVR #{self.dispatch_seq}] Sent "{command}" to '
+                f'/robot/command for avr_serial_node')
 
     # ── ACK from avr_serial_node ───────────────────────────────────────────
     def _on_cmd_ack(self, msg: String):
-        self.get_logger().info(
+        self.get_logger().debug(
             f'[ACK←AVR] avr_serial_node confirmed: {msg.data}')
 
     # ── Watchdog (runs every 100 ms) ───────────────────────────────────────

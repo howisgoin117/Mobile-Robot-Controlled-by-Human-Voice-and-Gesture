@@ -2,14 +2,15 @@
 FROM osrf/ros:humble-desktop
 
 # Install pip, required graphics for MediaPipe, and audio headers for PyAudio
-RUN apt-get update && apt-get install -y \
-    python3-pip \
-    nano \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    portaudio19-dev \
+RUN apt-get update && apt-get install -y \ 
+    python3-pip \ 
+    nano \ 
+    libgl1-mesa-glx \ 
+    libglib2.0-0 \ 
+    portaudio19-dev \ 
+    pulseaudio \
+    alsa-utils \
     && rm -rf /var/lib/apt/lists/*
-
 #dependencies for voice_node and gesture_node
 RUN pip3 install --no-cache-dir numpy==1.26.4 protobuf==4.25.3 mediapipe==0.10.14 pyaudio vosk pyserial
 

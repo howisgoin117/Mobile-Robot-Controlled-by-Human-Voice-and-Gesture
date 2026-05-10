@@ -6,21 +6,22 @@ import pyaudio
 import json
 import queue
 import threading
+import time
+import audioop
 from vosk import Model, KaldiRecognizer
 from datetime import datetime
 import csv
-
+import os
 # ── Map spoken keywords → robot commands ──────────────────────────────────
 VOICE_MAP = {
     "forward":  "forward",  "go":      "forward",   "ahead":   "forward",
     "backward": "backward", "reverse": "backward",   "back":    "backward",
-    "left":     "left",     "turn left": "left",
-    "right":    "right",    "turn right": "right",
+    "left":     "left",
+    "right":    "right",
     "stop":     "stop",     "halt":    "stop",       "pause":   "stop",
     "standby":  "standby",  "wait":    "standby",
-    "sleep":    "sleep",    "go to sleep": "sleep",
-    "tom":      "wake_word", "hey tom": "wake_word", "hey, tom": "wake_word", 
-    "hey top": "wake_word", "hey, todd": "wake_word", "start": "wake_word",
+    "tom":      "wake_word", "start": "wake_word",
+    "sleep":    "sleep",
 }
 
 SAMPLE_RATE = 16000
@@ -35,11 +36,22 @@ class VoiceNode(Node):
         model_path = self.declare_parameter(
             'vosk_model', '/ros2_ws/src/robot_controller/robot_controller/model/vosk-model-small-en-us-0.15'
         ).value
+        
+        self.mic_index = self.declare_parameter('mic_index', -1).value
 
         # ── VOSK setup ────────────────────────────────────────────────────
         self.get_logger().info(f'Loading VOSK model from {model_path} …')
         vosk_model       = Model(model_path)
-        self.recognizer  = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+        
+        # Build strict grammar list
+        unique_words = set()
+        for phrase in VOICE_MAP.keys():
+            for word in phrase.split():
+                unique_words.add(word)
+        unique_words.add("[unk]")
+        grammar_string = json.dumps(list(unique_words))
+        
+        self.recognizer  = KaldiRecognizer(vosk_model, SAMPLE_RATE, grammar_string)
         self.recognizer.SetWords(True)
 
         # ── Publisher ─────────────────────────────────────────────────────
@@ -56,6 +68,14 @@ class VoiceNode(Node):
 
         # ── Logging ───────────────────────────────────────────────────────
         self.log_file = 'voice_commands.csv'
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, mode='w', newline='', encoding='utf-8') as file:
+                writer = csv.writer(file)
+                writer.writerow(["Timestamp", "Command", "Raw_Transcription", "Inference_Time_ms"])
+
+        # ── Active Command for Continuous Streaming ───────────────────────
+        self.active_command = None
+        self.create_timer(0.1, self._publish_active_command)
 
         # ── Audio queue + background capture thread ────────────────────────
         self.audio_q: queue.Queue = queue.Queue(maxsize=30)
@@ -75,24 +95,32 @@ class VoiceNode(Node):
             self.get_logger().info('Voice node SLEEPING — waiting for wake word')
 
     #log to csv
-    def _log_to_csv(self, command, raw_text):
+    def _log_to_csv(self, command, raw_text, inference_time_ms):
         """Appends the recognized command and timestamp to the CSV file."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(self.log_file, mode='a', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
-            writer.writerow([timestamp, command, raw_text])
+            writer.writerow([timestamp, command, raw_text, inference_time_ms])
 
     # ── Audio capture (runs on its own daemon thread) ─────────────────────
     def _capture_audio(self):
         pa = pyaudio.PyAudio()
-        stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=SAMPLE_RATE,
-            input=True,
-            frames_per_buffer=CHUNK,
-        )
-        self.get_logger().info('Microphone stream opened')
+        
+        stream_kwargs = {
+            'format': pyaudio.paInt16,
+            'channels': 1,
+            'rate': SAMPLE_RATE,
+            'input': True,
+            'frames_per_buffer': CHUNK,
+        }
+        
+        if self.mic_index >= 0:
+            stream_kwargs['input_device_index'] = self.mic_index
+            self.get_logger().info(f'Opening PyAudio stream on device index {self.mic_index}')
+        else:
+            self.get_logger().info('Opening PyAudio stream on default device')
+            
+        stream = pa.open(**stream_kwargs)
         while rclpy.ok():
             data = stream.read(CHUNK, exception_on_overflow=False)
             try:
@@ -105,41 +133,53 @@ class VoiceNode(Node):
         while not self.audio_q.empty():
             data = self.audio_q.get_nowait()
 
-            if not self.recognizer.AcceptWaveform(data):
-                continue    # partial result — wait for full utterance
+            start_time = time.perf_counter()
+            is_accepted = self.recognizer.AcceptWaveform(data)
+            end_time = time.perf_counter()
 
+            if not is_accepted:
+                continue    # wait for full utterance
+
+            inference_time_ms = round((end_time - start_time) * 1000, 2)
             result = json.loads(self.recognizer.Result())
             text   = result.get('text', '').lower().strip()
 
             if not text:
                 continue
 
-            self.get_logger().info(f'Heard: "{text}"')
-            self._match_and_publish(text)
+            self.get_logger().info(f'Heard: "{text}" | Latency: {inference_time_ms} ms')
+            self._match_and_update(text, inference_time_ms)
 
-    def _match_and_publish(self, text: str):
+    def _match_and_update(self, text: str, inference_time_ms: float):
         # Check multi-word phrases first (e.g. "turn left") then single words
         for phrase in sorted(VOICE_MAP, key=len, reverse=True):
             if phrase in text:
                 command = VOICE_MAP[phrase]
 
-                # Gate: wake_word and sleep always pass through;
+                # Gate: wake_word always passes through;
                 # other commands only when awake
-                if command not in ('wake_word', 'sleep') and not self.is_awake:
+                if command != 'wake_word' and not self.is_awake:
                     self.get_logger().debug(
                         f'Ignored "{text}" — sleeping (say wake word first)')
                     return
 
-                payload = json.dumps({
-                    "source":     "voice",
-                    "command":    command,
-                    "transcript": text,
-                    "confidence": 1.0,
-                })
-                self._log_to_csv(command, text)
-                self.pub.publish(String(data=payload))
+                self.active_command = command
+                self._log_to_csv(command, text, inference_time_ms)
                 self.get_logger().info(f'Voice  ["{text}"] → {command}')
                 return  # only fire one command per utterance
+
+    def _publish_active_command(self):
+        if self.active_command:
+            # Wake word and sleep can be published even if is_awake is somewhat out of sync
+            if self.active_command not in ['wake_word'] and not self.is_awake:
+                return
+            
+            payload = json.dumps({
+                "source": "voice",
+                "command": self.active_command,
+                "confidence": 1.0,
+            })
+            self.pub.publish(String(data=payload))
 
 
 def main():
