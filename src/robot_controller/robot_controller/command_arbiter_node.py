@@ -70,6 +70,11 @@ class CommandArbiterNode(Node):
             self._wake_up()
             return                      # don't dispatch wake_word as a motor cmd
 
+        if command == 'sleep':
+            if self.is_awake:
+                self._go_to_sleep('sleep command received via voice')
+            return                      # never forward 'sleep' to the robot
+
         # Voice always overrides gesture (higher priority)
         if self.is_awake:
             self._dispatch(command, source='voice')

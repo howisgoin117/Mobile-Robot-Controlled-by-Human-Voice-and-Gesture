@@ -19,7 +19,7 @@ from rcl_interfaces.msg import SetParametersResult
 
 
 # ── Tuning (must match Arduino FIXED_VEL / STEER_RATIO) ───────────────────────
-FIXED_VEL   = 0.2           # matches Arduino FIXED_VEL
+FIXED_VEL   = 0.3           # matches Arduino FIXED_VEL
 STEER_RATIO = 0.30          # fraction of FIXED_VEL used for steering
 CONNECTION_CHECK_INTERVAL = 2.0
 
@@ -91,6 +91,7 @@ class AVRSerialNode(Node):
 
     # ── Serial connection ──────────────────────────────────────────────────
     def _connect(self, port, baudrate):
+        import os
         with self.serial_lock:
             if self.serial and self.serial.is_open:
                 try:
@@ -98,6 +99,15 @@ class AVRSerialNode(Node):
                     self.get_logger().info('Previous serial connection closed')
                 except Exception:
                     pass
+
+            # Quick sanity check: does the device file exist at all?
+            if not os.path.exists(port):
+                self.get_logger().error(
+                    f'✘ Serial port "{port}" does NOT exist. '
+                    f'Check --device flag in your docker run command and '
+                    f'that the Arduino is plugged in.')
+                self._publish_status('disconnected', port, 'device file not found')
+                return
 
             try:
                 self.serial = serial.Serial(port, baudrate, timeout=1)
@@ -109,7 +119,13 @@ class AVRSerialNode(Node):
             except serial.SerialException as e:
                 self.serial = None
                 self.get_logger().error(
-                    f'✘ Serial FAILED to open {port}: {e}')
+                    f'✘ Serial FAILED to open {port}: {e}\n'
+                    f'  → Check USB cable, --device flag, and port permissions (try: ls -la {port})')
+                self._publish_status('disconnected', port, str(e))
+            except Exception as e:
+                self.serial = None
+                self.get_logger().error(
+                    f'✘ Unexpected error opening {port}: {type(e).__name__}: {e}')
                 self._publish_status('disconnected', port, str(e))
 
     # ── Publish status to /serial/status ───────────────────────────────────
@@ -195,8 +211,8 @@ class AVRSerialNode(Node):
             except serial.SerialException as e:
                 self.get_logger().warn(f'[ARD] Read error (port lost?): {e}')
                 time.sleep(1)
-            except Exception:
-                pass
+            except Exception as e:
+                self.get_logger().debug(f'[ARD] Reader exception: {type(e).__name__}: {e}')
 
     def _parse_arduino_response(self, line: str):
         """Parse Arduino output to track state and log important events."""

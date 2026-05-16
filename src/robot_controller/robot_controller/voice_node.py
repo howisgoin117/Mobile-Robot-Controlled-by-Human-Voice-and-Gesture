@@ -156,11 +156,16 @@ class VoiceNode(Node):
             if phrase in text:
                 command = VOICE_MAP[phrase]
 
-                # Gate: wake_word always passes through;
+                # Gate: wake_word and sleep always pass through;
                 # other commands only when awake
-                if command != 'wake_word' and not self.is_awake:
+                if command not in ('wake_word', 'sleep') and not self.is_awake:
                     self.get_logger().debug(
                         f'Ignored "{text}" — sleeping (say wake word first)')
+                    return
+
+                # sleep is only meaningful when awake
+                if command == 'sleep' and not self.is_awake:
+                    self.get_logger().debug('Ignored "sleep" — robot already sleeping')
                     return
 
                 self.active_command = command
@@ -170,8 +175,9 @@ class VoiceNode(Node):
 
     def _publish_active_command(self):
         if self.active_command:
-            # Wake word and sleep can be published even if is_awake is somewhat out of sync
-            if self.active_command not in ['wake_word'] and not self.is_awake:
+            # wake_word passes even while sleeping; sleep passes even while awake;
+            # other movement commands only stream while awake
+            if self.active_command not in ('wake_word', 'sleep') and not self.is_awake:
                 return
             
             payload = json.dumps({
