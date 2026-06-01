@@ -4,12 +4,34 @@ import time
 from rclpy.node import Node
 from std_msgs.msg import String, Bool
 
-WAKE_TIMEOUT    = 10.0   # seconds of active listening after wake word
+WAKE_TIMEOUT    = 50.0   # seconds of active listening after wake word
 COMMAND_TIMEOUT = 1.5    # seconds before auto-stop within awake window
 GESTURE_ACTIVE_WINDOW = 2.0  # if gesture received within this window, robot stays awake
 
 
 class CommandArbiterNode(Node):
+    """Subsumption-based command arbiter.
+
+    Three priority levels control which input source drives the robot:
+
+      Level 0 (highest) — EMERGENCY STOP
+        "stop" from ANY source (voice or gesture) is always accepted
+        immediately. It also clears the voice-active lock so gesture
+        can take over afterwards.
+
+      Level 1 — VOICE COMMANDS
+        When voice sends a movement command, a ``voice_active`` flag
+        is raised.  While the flag is set, all gesture commands except
+        "stop" are suppressed.  The flag is cleared when:
+          • voice sends "stop"  (explicit end of voice session), or
+          • gesture sends "stop" (Level 0 override), or
+          • the watchdog fires   (COMMAND_TIMEOUT with no new input).
+
+      Level 2 (lowest) — GESTURE COMMANDS
+        Gesture commands are only accepted when ``voice_active`` is
+        False (i.e. no active voice session).
+    """
+
     def __init__(self):
         super().__init__('command_arbiter_node')
 
@@ -20,6 +42,12 @@ class CommandArbiterNode(Node):
         self.last_received  = time.time()
         self.last_gesture_time = 0.0    # tracks when last gesture command arrived
         self.dispatch_seq   = 0         # sequence number for dispatched commands
+
+        # ── Subsumption flags ──────────────────────────────────────────────
+        self.voice_active = False       # True while voice owns the robot
+        self.gesture_stop_active = False # True while gesture 'stop' is active
+        self.last_gesture_stop_time = 0.0
+        self.gesture_blocked_until = 0.0 # Time until gestures are ignored after voice 'stop'
 
         # ── Subscriptions ──────────────────────────────────────────────────
         self.create_subscription(String, '/gesture/command', self._on_gesture, 10)
@@ -42,93 +70,134 @@ class CommandArbiterNode(Node):
         """Transition to AWAKE state and start the timeout window."""
         self.is_awake       = True
         self.awake_deadline = time.time() + WAKE_TIMEOUT
+        self.voice_active   = False
         self.awake_pub.publish(Bool(data=True))
         self.get_logger().info(
             f'Robot AWAKENED — listening for {WAKE_TIMEOUT}s')
 
     def _go_to_sleep(self, reason: str):
         """Transition to SLEEPING state and stop the robot."""
-        self.is_awake = False
+        self.is_awake     = False
+        self.voice_active = False
         self.awake_pub.publish(Bool(data=False))
         self.cmd_pub.publish(String(data="stop"))
         self.last_command = "stop"
         self.get_logger().info(f'Robot SLEEPING — {reason}')
 
-    # ── Callbacks ──────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    #  VOICE CALLBACK  (Level 0 + Level 1)
+    # ══════════════════════════════════════════════════════════════════════
     def _on_voice(self, msg: String):
-        self.get_logger().debug(f'[DEBUG] Raw voice msg received: {msg.data}')
         try:
             data = json.loads(msg.data)
-        except json.JSONDecodeError as e:
-            self.get_logger().error(f'[DEBUG] Failed to parse voice JSON: {e}')
+        except json.JSONDecodeError:
             return
         command = data.get('command', '')
-        self.get_logger().debug(
-            f'[DEBUG] Voice parsed — command="{command}"  awake={self.is_awake}')
 
+        # ── Meta commands (always processed) ──────────────────────────────
         if command == 'wake_word':
             self._wake_up()
-            return                      # don't dispatch wake_word as a motor cmd
+            return
 
         if command == 'sleep':
             if self.is_awake:
                 self._go_to_sleep('sleep command received via voice')
-            return                      # never forward 'sleep' to the robot
-
-        # Voice always overrides gesture (higher priority)
-        if self.is_awake:
-            self._dispatch(command, source='voice')
-        else:
-            self.get_logger().debug(
-                f'Ignored voice "{command}" — robot is sleeping')
-
-    def _on_gesture(self, msg: String):
-        self.get_logger().debug(f'[DEBUG] Raw gesture msg received: {msg.data}')
-        try:
-            data = json.loads(msg.data)
-        except json.JSONDecodeError as e:
-            self.get_logger().error(f'[DEBUG] Failed to parse gesture JSON: {e}')
             return
-        command = data.get('command', '')
-        confidence = data.get('confidence', 0)
-        self.get_logger().debug(
-            f'[DEBUG] Gesture parsed — command="{command}"  '
-            f'confidence={confidence}  awake={self.is_awake}')
 
         if not self.is_awake:
-            self.get_logger().debug(
-                f'Ignored gesture "{command}" — robot is sleeping')
             return
 
-        if confidence >= 0.75:
-            # Track gesture activity to keep robot awake during continuous gestures
+        # ── Check if gesture 'stop' is actively blocking ──────────────────
+        # Gesture 'stop' has ultimate priority when held
+        if self.gesture_stop_active and (time.time() - self.last_gesture_stop_time < 0.5):
+            self.get_logger().debug(
+                f'Voice "{command}" suppressed — gesture "stop" is active')
+            return
+
+        # ── Level 0: voice "stop" — execute + end voice session ──────────
+        if command == 'stop':
+            self.voice_active = False
+            
+            # Only start the 10s block if we aren't already blocked, to prevent looping
+            if time.time() >= self.gesture_blocked_until:
+                self.gesture_blocked_until = time.time() + 10.0
+                self.get_logger().info(
+                    '[SUBSUMPTION] Voice session ENDED (voice said "stop"). '
+                    'Gestures BLOCKED for 10 seconds.')
+                
+            self._dispatch(command, source='voice')
+            return
+
+        # ── Level 1: voice movement — raise flag, suppress gesture ───────
+        if not self.voice_active:
+            self.get_logger().info(
+                f'[SUBSUMPTION] Voice session STARTED — '
+                f'gesture suppressed until voice "stop"')
+        self.voice_active = True
+        self._dispatch(command, source='voice')
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  GESTURE CALLBACK  (Level 0 + Level 2)
+    # ══════════════════════════════════════════════════════════════════════
+    def _on_gesture(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        command    = data.get('command', '')
+        confidence = data.get('confidence', 0)
+
+        if not self.is_awake:
+            return
+
+        # ── 10-Second Block after Voice "stop" ───────────────────────────
+        if time.time() < self.gesture_blocked_until:
+            remaining = self.gesture_blocked_until - time.time()
+            self.get_logger().debug(
+                f'Gesture "{command}" ignored — blocked for {remaining:.1f}s after voice "stop"')
+            return
+
+        if confidence < 0.75:
+            return
+
+        # ── Level 0: gesture "stop" — always passes, clears voice lock ───
+        if command == 'stop':
+            self.voice_active = False
+            self.gesture_stop_active = True
+            self.last_gesture_stop_time = time.time()
             self.last_gesture_time = time.time()
             self._dispatch(command, source='gesture')
-        else:
             self.get_logger().info(
-                f'Gesture "{command}" below threshold ({confidence} < 0.75)')
+                '[SUBSUMPTION] Voice session OVERRIDDEN by gesture "stop"')
+            return
+
+        # ── Level 2: gesture movement — only when voice is NOT active ────
+        if self.voice_active:
+            self.get_logger().debug(
+                f'Gesture "{command}" suppressed — voice has priority')
+            return
+
+        self.last_gesture_time = time.time()
+        self._dispatch(command, source='gesture')
 
     # ── Command dispatch ───────────────────────────────────────────────────
     def _dispatch(self, command: str, source: str):
         command_changed = (command != self.last_command)
-        
+
         self.last_command  = command
         self.last_received = time.time()
-        
+
         # Reset the wake timeout on every accepted command
         self.awake_deadline = time.time() + WAKE_TIMEOUT
 
         self.cmd_pub.publish(String(data=command))
-        
+
         if command_changed:
             self.dispatch_seq += 1
             remaining = self.awake_deadline - time.time()
             self.get_logger().info(
                 f'[DISPATCH #{self.dispatch_seq}] [{source}] → "{command}"  '
                 f'(wake window: {remaining:.1f}s remaining)')
-            self.get_logger().info(
-                f'[TX→AVR #{self.dispatch_seq}] Sent "{command}" to '
-                f'/robot/command for avr_serial_node')
 
     # ── ACK from avr_serial_node ───────────────────────────────────────────
     def _on_cmd_ack(self, msg: String):
@@ -143,10 +212,14 @@ class CommandArbiterNode(Node):
         now = time.time()
         gesture_active = (now - self.last_gesture_time) < GESTURE_ACTIVE_WINDOW
 
+        # 0. Check if gesture block just expired
+        if self.gesture_blocked_until > 0 and now >= self.gesture_blocked_until:
+            self.gesture_blocked_until = 0.0  # Reset so it logs only once
+            self.get_logger().info('[SUBSUMPTION] 10-second block expired. Gesture command is READY.')
+
         # 1. Wake timeout — but keep alive if gesture commands are flowing
         if now > self.awake_deadline:
             if gesture_active:
-                # Gesture commands still coming in — extend the wake window
                 self.awake_deadline = now + WAKE_TIMEOUT
                 self.get_logger().debug(
                     '[WATCHDOG] Gesture still active — extending wake window')
@@ -154,11 +227,15 @@ class CommandArbiterNode(Node):
                 self._go_to_sleep('wake timeout expired (no active gesture)')
                 return
 
-        # 2. Command timeout — no new command within COMMAND_TIMEOUT → auto-stop
-        #    But NOT if gestures are continuously streaming a movement command
+        # 2. Command timeout — no new command within COMMAND_TIMEOUT
+        #    Also clears voice_active so gesture can take over after silence.
         if (now - self.last_received > COMMAND_TIMEOUT
                 and self.last_command != "stop"
                 and not gesture_active):
+            if self.voice_active:
+                self.get_logger().info(
+                    '[SUBSUMPTION] Voice session EXPIRED (command timeout)')
+            self.voice_active = False
             self._dispatch("stop", source="watchdog")
 
 

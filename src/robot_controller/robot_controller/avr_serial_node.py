@@ -28,12 +28,14 @@ class AVRSerialNode(Node):
     def __init__(self):
         super().__init__('avr_serial_node')
 
-        self.port     = self.declare_parameter('port',     '/dev/ttyACM1').value
+        self.port     = self.declare_parameter('port',     '/dev/ttyACM0').value
         self.baudrate = self.declare_parameter('baudrate', 115200).value
 
         self.serial = None
         self.serial_lock = threading.Lock()
         self.last_cmd = "stop"
+        self.last_pan_raw = None
+        self.last_tilt_raw = None
 
         # ── Arduino state (tracked from serial responses) ──────────────────
         self.motor_on    = False      # tracks Arduino motorOn
@@ -56,6 +58,9 @@ class AVRSerialNode(Node):
 
         # Subscribe to /robot/command from command_arbiter_node
         self.create_subscription(String, '/robot/command', self._on_command, 10)
+
+        # Subscribe to /arduino_tx for raw servo commands (pan/tilt bytes)
+        self.create_subscription(String, 'arduino_tx', self._on_servo_raw, 10)
 
         # Subscriber: allow changing port at runtime via topic
         self.create_subscription(String, '/serial/set_port', self._on_set_port, 10)
@@ -247,7 +252,7 @@ class AVRSerialNode(Node):
 
         # ── Velocity command accepted ─────────────────────────────────────
         if line.startswith('[OK] L='):
-            self.get_logger().info(f'[ARD] ✔ {line}')
+            self.get_logger().debug(f'[ARD] ✔ {line}')
             return
 
         # ── Errors that indicate commands are rejected ────────────────────
@@ -277,12 +282,14 @@ class AVRSerialNode(Node):
         self.cmds_received += 1
         prev_cmd = self.last_cmd
         self.last_cmd = cmd
-
         cmd_changed = (cmd != prev_cmd)
         if cmd_changed:
             self.get_logger().info(
                 f'[RX #{self.cmds_received}] Command changed: '
                 f'"{prev_cmd}" → "{cmd}"')
+            # Flush pending serial data to prevent stale commands
+            # from executing out of order on the Arduino
+            self._flush_serial()
 
         success = self._send_command(cmd, log=cmd_changed)
 
@@ -304,6 +311,37 @@ class AVRSerialNode(Node):
                 f'[NACK #{self.cmds_received}] Failed to send "{cmd}" '
                 f'to Arduino')
         self.ack_pub.publish(ack_msg)
+
+    # ── Raw servo passthrough (pan/tilt from gesture_node) ─────────────────
+    def _on_servo_raw(self, msg: String):
+        """Write raw servo bytes (L/R/U/D/X/Y) directly to serial.
+
+        Uses _write_serial_raw to bypass the motor command counters
+        so servo traffic does not inflate cmds_sent_ok / cmds_sent_fail.
+        """
+        raw = msg.data.strip()
+        if not raw:
+            return
+        with self.serial_lock:
+            ser = self.serial
+            is_open = ser is not None and ser.is_open
+        if is_open:
+            try:
+                ser.write((raw + '\n').encode())
+                
+                # Log when tilt command changes
+                if raw in ['U', 'D', 'Y']:
+                    if raw != self.last_tilt_raw:
+                        self.get_logger().info(f"[SERVO TX] Tilt command sent to Arduino: '{raw}'")
+                        self.last_tilt_raw = raw
+                
+                # Log when pan command changes
+                if raw in ['L', 'R', 'X']:
+                    if raw != self.last_pan_raw:
+                        self.get_logger().info(f"[SERVO TX] Pan command sent to Arduino: '{raw}'")
+                        self.last_pan_raw = raw
+            except serial.SerialException:
+                pass  # servo failures are non-critical
 
     # ── Heartbeat ──────────────────────────────────────────────────────────
     def _heartbeat(self):
@@ -344,6 +382,15 @@ class AVRSerialNode(Node):
             return False
 
         return self._write_serial(serial_cmd, label=cmd, log=log)
+
+    # ── Flush serial buffers ───────────────────────────────────────────────
+    def _flush_serial(self):
+        """Clear pending data in both directions to prevent stale commands."""
+        with self.serial_lock:
+            if self.serial and self.serial.is_open:
+                self.serial.reset_output_buffer()  # discard unsent commands
+                self.serial.reset_input_buffer()   # discard stale responses
+                self.get_logger().debug('[FLUSH] Serial buffers cleared')
 
     # ── Low-level serial write ─────────────────────────────────────────────
     def _write_serial(self, data: str, label: str = '', log: bool = True) -> bool:

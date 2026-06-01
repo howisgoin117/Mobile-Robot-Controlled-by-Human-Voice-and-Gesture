@@ -12,6 +12,7 @@ import csv
 import time
 import math
 from datetime import datetime
+from collections import OrderedDict
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from mediapipe.framework.formats import landmark_pb2
@@ -137,8 +138,6 @@ def log_command(command_name, fps, inference_time, filepath="robot_commands.csv"
     with open(filepath, mode='a', newline='') as file:
         writer = csv.writer(file)
         writer.writerow([timestamp, command_name, f"{fps:.1f}", f"{inference_time:.1f}"])
-        
-    print(f"Logged: {command_name} at {timestamp} | FPS: {fps:.1f} | Inference: {inference_time:.1f}ms")
 
 # Create folder to save captures
 CAPTURE_DIR = "captures"
@@ -172,6 +171,90 @@ def classify_two_hands(lm1, lm2) -> str | None:
         if scenario_a or scenario_b:
             return name
     return None
+
+
+# Centroid tracking for human pose — assigns persistent IDs across frames
+class PointTracker:
+    def __init__(self, maxDisappeared=10, maxDistance=150):
+        self.nextObjectID = 0
+        self.objects = OrderedDict()
+        self.disappeared = OrderedDict()
+        self.maxDisappeared = maxDisappeared
+        self.maxDistance = maxDistance
+
+    def register(self, centroid):
+        self.objects[self.nextObjectID] = centroid
+        self.disappeared[self.nextObjectID] = 0
+        self.nextObjectID += 1
+
+    def deregister(self, objectID):
+        del self.objects[objectID]
+        del self.disappeared[objectID]
+
+    def update(self, input_centroids):
+        if len(input_centroids) == 0:
+            for objectID in list(self.disappeared.keys()):
+                self.disappeared[objectID] += 1
+                if self.disappeared[objectID] > self.maxDisappeared:
+                    self.deregister(objectID)
+            return self.objects
+
+        if len(self.objects) == 0:
+            for i in range(len(input_centroids)):
+                self.register(input_centroids[i])
+        else:
+            objectIDs = list(self.objects.keys())
+            objectCentroids = list(self.objects.values())
+
+            D = np.zeros((len(objectCentroids), len(input_centroids)))
+            for i, c1 in enumerate(objectCentroids):
+                for j, c2 in enumerate(input_centroids):
+                    D[i, j] = calculate_pixel_distance(c1, c2)
+
+            rows = D.min(axis=1).argsort()
+            cols = D.argmin(axis=1)[rows]
+
+            usedRows = set()
+            usedCols = set()
+
+            for (row, col) in zip(rows, cols):
+                if row in usedRows or col in usedCols:
+                    continue
+                if D[row, col] > self.maxDistance:
+                    continue
+                objectID = objectIDs[row]
+                self.objects[objectID] = input_centroids[col]
+                self.disappeared[objectID] = 0
+                usedRows.add(row)
+                usedCols.add(col)
+
+            unusedRows = set(range(D.shape[0])).difference(usedRows)
+            unusedCols = set(range(D.shape[1])).difference(usedCols)
+
+            for row in unusedRows:
+                objectID = objectIDs[row]
+                self.disappeared[objectID] += 1
+                if self.disappeared[objectID] > self.maxDisappeared:
+                    self.deregister(objectID)
+
+            for col in unusedCols:
+                self.register(input_centroids[col])
+
+        return self.objects
+
+
+# Pose-based gesture definitions (body-level, not hand-level)
+def pose_gesture_stop(pose_lms):
+    """Both hands raised above shoulders."""
+    left_hand_up = pose_lms[15].y < pose_lms[11].y
+    right_hand_up = pose_lms[16].y < pose_lms[12].y
+    return left_hand_up and right_hand_up
+
+def pose_gesture_move_left(pose_lms):
+    """Left arm extended outward."""
+    return (angle(pose_lms[11], pose_lms[13], pose_lms[15]) > 150 and
+            angle(pose_lms[23], pose_lms[11], pose_lms[13]) > 80)
+
 
 class GestureNode(Node):
     def __init__(self):
@@ -222,6 +305,7 @@ class GestureNode(Node):
         pose_options = vision.PoseLandmarkerOptions(
             base_options=pose_base_options,
             running_mode=vision.RunningMode.IMAGE,
+            num_poses=4,
             min_pose_detection_confidence=0.6,
             min_tracking_confidence=0.6
         )
@@ -269,12 +353,26 @@ class GestureNode(Node):
         self.saved_pose_landmarks = None
         self.user_left_wrist = None
         self.user_right_wrist = None
-            
-        # 8. THE TIMER (Replaces the while loop)
+
+        # 8. CENTROID TRACKER — persistent multi-person tracking
+        self.tracker = PointTracker(maxDisappeared=15, maxDistance=150)
+        self.operator_id = None
+        self.tracked_objects = {}
+
+        # 9. SERVO CONTROL STATE — dead-zone based pan/tilt
+        self.last_pan_command = None
+        self.last_tilt_command = None
+        self.servo_pub = self.create_publisher(String, 'arduino_tx', 10)
+
+        # 10. GESTURE COMMAND HOLD — publish at controlled rate, auto-clear
+        self.active_gesture_command = None
+        self.create_timer(0.2, self._publish_gesture_command)  # 5 Hz
+
+        # 11. THE TIMER (Replaces the while loop)
         # 0.05 seconds = 20 Frames Per Second
         self.timer = self.create_timer(0.05, self.timer_callback)
 
-        # 9. WAKE STATE
+        # 12. WAKE STATE
         self.standalone = self.declare_parameter('standalone', False).value
         if self.standalone:
             self.is_awake = True
@@ -283,7 +381,7 @@ class GestureNode(Node):
             self.is_awake = False
             self.create_subscription(Bool, '/is_awake', self._on_awake, 10)
 
-        # 10. CAMERA SLEEP TOGGLE
+        # 13. CAMERA SLEEP TOGGLE
         # When True, camera processing pauses during sleep to save CPU.
         # When False, camera & detection keep running but commands are not published.
         self.camera_sleep_when_idle = self.declare_parameter(
@@ -336,6 +434,26 @@ class GestureNode(Node):
         elif not self.is_awake and prev:
             self.get_logger().info('Gesture node SLEEPING — ignoring gestures')
 
+    # ── Gesture command publisher (5 Hz) ─────────────────────────────────
+    def _publish_gesture_command(self):
+        """Publish the active gesture command at a controlled rate (5 Hz).
+
+        When no gesture is recognized, active_gesture_command is set to None
+        by timer_callback, and publishing stops automatically. The arbiter's
+        watchdog (COMMAND_TIMEOUT) will then auto-stop the robot.
+        """
+        if self.active_gesture_command is None:
+            return
+        if not self.is_awake:
+            return
+        msg = String()
+        msg.data = json.dumps({
+            "source": "gesture",
+            "command": self.active_gesture_command,
+            "confidence": 1.0,
+        })
+        self.command_publisher.publish(msg)
+
     def timer_callback(self):
         """This function runs automatically 20 times a second."""
         # If camera_sleep_when_idle is enabled, skip everything while sleeping
@@ -364,21 +482,59 @@ class GestureNode(Node):
 
         # ── 2. ASYMMETRIC FRAME SKIPPING: Run Pose Model every 5 frames ─
         self.frame_counter += 1
+        operator_pose_landmarks = None
+
         if self.frame_counter % 5 == 0:
             pose_results = self.pose_landmarker.detect(mp_image)
+            input_centroids = []
 
-            # Update saved pose data if a body is detected
             if pose_results.pose_landmarks:
-                self.saved_pose_landmarks = pose_results.pose_landmarks[0]
-                lm15 = self.saved_pose_landmarks[15]  # Left Wrist
-                lm16 = self.saved_pose_landmarks[16]  # Right Wrist
+                for pose in pose_results.pose_landmarks:
+                    lm11, lm12 = pose[11], pose[12]
+                    if lm11.visibility > 0.5 and lm12.visibility > 0.5:
+                        cx = int(((lm11.x + lm12.x) / 2) * w)
+                        cy = int(((lm11.y + lm12.y) / 2) * h)
+                        input_centroids.append((cx, cy))
 
-                self.user_left_wrist = (int(lm15.x * w), int(lm15.y * h)) if lm15.visibility > 0.5 else None
-                self.user_right_wrist = (int(lm16.x * w), int(lm16.y * h)) if lm16.visibility > 0.5 else None
-            else:
-                self.saved_pose_landmarks = None
+            self.tracked_objects = self.tracker.update(input_centroids)
+
+            # Cleanup: if locked operator disappeared, release the lock
+            if self.operator_id is not None and self.operator_id not in self.tracked_objects:
+                self.operator_id = None
                 self.user_left_wrist = None
                 self.user_right_wrist = None
+                self.saved_pose_landmarks = None
+                self.get_logger().info('Lost Operator entirely. Waiting for new lock...')
+
+            # Lock onto a new visible operator
+            if self.operator_id is None and len(self.tracked_objects) > 0:
+                for obj_id in self.tracked_objects.keys():
+                    if self.tracker.disappeared[obj_id] == 0:
+                        self.operator_id = obj_id
+                        self.get_logger().info(f'Locked onto NEW Operator ID: {self.operator_id}')
+                        break
+
+            # Extract wrist landmarks from the operator's pose
+            if self.operator_id in self.tracked_objects and pose_results.pose_landmarks:
+                op_centroid = self.tracked_objects[self.operator_id]
+                for pose in pose_results.pose_landmarks:
+                    lm11, lm12 = pose[11], pose[12]
+                    if lm11.visibility > 0.5 and lm12.visibility > 0.5:
+                        cx = int(((lm11.x + lm12.x) / 2) * w)
+                        cy = int(((lm11.y + lm12.y) / 2) * h)
+                        if (cx, cy) == op_centroid:
+                            operator_pose_landmarks = pose
+                            self.saved_pose_landmarks = pose
+                            lm15, lm16 = pose[15], pose[16]
+                            self.user_left_wrist = (
+                                (int(lm15.x * w), int(lm15.y * h))
+                                if lm15.visibility > 0.5 else None
+                            )
+                            self.user_right_wrist = (
+                                (int(lm16.x * w), int(lm16.y * h))
+                                if lm16.visibility > 0.5 else None
+                            )
+                            break
 
         self.inference_time_ms = (time.time() - start_inference) * 1000
 
@@ -400,7 +556,71 @@ class GestureNode(Node):
                 self.mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=2)
             )
 
-        # ── 4. FILTERING: ISOLATE THE USER'S HANDS ──────────────────────
+        # ── 4. DEAD ZONE & SERVO TRACKING ───────────────────────────────
+        dead_zone_w = int(w * 0.5)
+        dead_zone_h = int(h * 0.7)
+        dz_x1 = (w - dead_zone_w) // 2
+        dz_y1 = (h - dead_zone_h) // 2
+        dz_x2 = dz_x1 + dead_zone_w
+        dz_y2 = dz_y1 + dead_zone_h
+
+        cv2.rectangle(frame, (dz_x1, dz_y1), (dz_x2, dz_y2), (255, 0, 0), 2)
+        cv2.putText(frame, "LOCK ZONE", (dz_x1, dz_y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+
+        if (self.operator_id in self.tracked_objects
+                and self.tracker.disappeared.get(self.operator_id, 1) == 0):
+            op_centroid = self.tracked_objects[self.operator_id]
+            cx, cy = op_centroid
+            cv2.circle(frame, op_centroid, 5, (0, 255, 0), -1)
+            cv2.putText(frame, "OPERATOR", (cx - 20, cy - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            pan_cmd, tilt_cmd = "HOLD_X", "HOLD_Y"
+            pan_byte, tilt_byte = "X", "Y"
+
+            if cx < dz_x1:
+                pan_cmd, pan_byte = "PAN_LEFT", "L"
+            elif cx > dz_x2:
+                pan_cmd, pan_byte = "PAN_RIGHT", "R"
+
+            if cy < dz_y1:
+                tilt_cmd, tilt_byte = "TILT_UP", "U"
+            elif cy > dz_y2:
+                tilt_cmd, tilt_byte = "TILT_DOWN", "D"
+
+            # Publish servo commands via arduino_tx topic
+            servo_msg = String()
+            servo_msg.data = pan_byte
+            self.servo_pub.publish(servo_msg)
+            servo_msg.data = tilt_byte
+            self.servo_pub.publish(servo_msg)
+
+            if pan_cmd != self.last_pan_command:
+                self.get_logger().debug(f'[SERVO] X-Axis → {pan_cmd} (Byte: {pan_byte})')
+                self.last_pan_command = pan_cmd
+            if tilt_cmd != self.last_tilt_command:
+                self.get_logger().debug(f'[SERVO] Y-Axis → {tilt_cmd} (Byte: {tilt_byte})')
+                self.last_tilt_command = tilt_cmd
+
+            cv2.putText(frame, f"CAM X: {pan_cmd}", (w - 250, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(frame, f"CAM Y: {tilt_cmd}", (w - 250, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        else:
+            # Operator out of frame — send HOLD
+            servo_msg = String()
+            servo_msg.data = "X"
+            self.servo_pub.publish(servo_msg)
+            servo_msg.data = "Y"
+            self.servo_pub.publish(servo_msg)
+
+            if self.last_pan_command != "HOLD_X" or self.last_tilt_command != "HOLD_Y":
+                self.get_logger().debug('[SERVO] Operator out of frame — HOLD')
+                self.last_pan_command = "HOLD_X"
+                self.last_tilt_command = "HOLD_Y"
+
+        # ── 5. FILTERING: ISOLATE THE USER'S HANDS ──────────────────────
         if hand_results.hand_landmarks:
             for hand_lms in hand_results.hand_landmarks:
                 hand_wrist_px = (int(hand_lms[0].x * w), int(hand_lms[0].y * h))
@@ -425,7 +645,7 @@ class GestureNode(Node):
                     cv2.putText(frame, "IGNORED", hand_wrist_px,
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
 
-        # ── 5. APPLYING HEURISTICS ───────────────────────────────────────
+        # ── 6. APPLYING HEURISTICS ───────────────────────────────────────
         if user_hand_landmarks:
             stop_detected = False
 
@@ -466,29 +686,35 @@ class GestureNode(Node):
                     cv2.putText(frame, "Bring up second hand", (20, 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)
 
-        # ── 6. LOGGING, CAPTURING, AND PUBLISHING ────────────────────────
+        # ── 7. POSE GESTURE FALLBACK ─────────────────────────────────
+        if current_command is None and operator_pose_landmarks is not None:
+            if pose_gesture_stop(operator_pose_landmarks):
+                current_command = "stop"
+                cv2.putText(frame, "POSE: EMERGENCY STOP", (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)
+            elif pose_gesture_move_left(operator_pose_landmarks):
+                current_command = "left"
+                cv2.putText(frame, "POSE: LEFT", (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)
+            else:
+                cv2.putText(frame, "Tracking Operator - Awaiting Command", (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+
+        # ── 8. UPDATE ACTIVE GESTURE COMMAND ────────────────────────────
         if current_command is not None:
-            
+            self.active_gesture_command = current_command
+
             # Only publish if robot is awake
             if not self.is_awake:
                 if current_command != self.previous_command:
                     self.get_logger().debug(
                         f'Ignored gesture "{current_command}" — robot is sleeping')
             else:
-                #PUBLISH TO ROS 2 ** (CONTINUOUSLY)
-                msg = String()
-                msg.data = json.dumps({
-                    "source": "gesture",
-                    "command": current_command,
-                    "confidence": 1.0,
-                })
-                self.command_publisher.publish(msg)
-                
                 # Only log and capture locally if the command changes
                 if current_command != self.previous_command:
                     self.get_logger().info(f"Published command: {current_command}")
                     log_command(current_command, self.fps, self.inference_time_ms)
-                    
+
                     #picture capturing
                     safe_time = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"{self.CAPTURE_DIR}/{current_command}_{safe_time}.jpg"
@@ -496,16 +722,18 @@ class GestureNode(Node):
             
             self.previous_command = current_command    
             
-        elif current_command is None:
-            self.previous_command = None        
+        else:
+            # No gesture recognized — auto-clear the held command
+            self.active_gesture_command = None
+            self.previous_command = None
 
-        # ── 7. DISPLAY METRICS ───────────────────────────────────────────
+        # ── 9. DISPLAY METRICS ───────────────────────────────────────────
         cv2.putText(frame, f"FPS: {int(self.fps)}", (20, 100),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
         cv2.putText(frame, f"Inference: {int(self.inference_time_ms)} ms", (20, 140),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
 
-        # ── 8. OUTPUT — GUI window or video file ─────────────────────────
+        # ── 10. OUTPUT — GUI window or video file ───────────────────────
         if self.gui_available:
             cv2.imshow('Hand Gesture Recognition', frame)
             cv2.waitKey(1)

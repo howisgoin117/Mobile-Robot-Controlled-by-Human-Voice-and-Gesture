@@ -3,13 +3,15 @@ from rclpy.node import Node
 from std_msgs.msg import String
 import serial
 import time
+import threading
+import sys
 
 class ArduinoSerialNode(Node):
     def __init__(self):
         super().__init__('arduino_serial_node')
         
         # Configure Serial Port
-        self.declare_parameter('port', '/dev/ttyACM1')
+        self.declare_parameter('port', '/dev/ttyACM0')
         self.declare_parameter('baudrate', 115200)
         
         port = self.get_parameter('port').value
@@ -35,6 +37,28 @@ class ArduinoSerialNode(Node):
 
         # Timer to check for incoming serial data
         self.timer = self.create_timer(0.1, self.read_from_arduino_callback)
+
+        # Start keyboard input thread
+        self.input_thread = threading.Thread(target=self.keyboard_input_loop, daemon=True)
+        self.input_thread.start()
+
+    def keyboard_input_loop(self):
+        """Continuously read keyboard input and send to Arduino"""
+        time.sleep(1) # Delay slightly to allow startup logs to print
+        print("Ready for keyboard commands (e.g., 'tl', 'tr', 'v 0.2'). Type and press Enter:")
+        while rclpy.ok():
+            try:
+                cmd = sys.stdin.readline()
+                if not cmd: # EOF
+                    break
+                cmd = cmd.strip()
+                if cmd:
+                    serial_msg = cmd + '\n'
+                    self.serial_conn.write(serial_msg.encode('utf-8'))
+                    self.get_logger().info(f"Keyboard sent: {cmd}")
+            except Exception as e:
+                self.get_logger().error(f"Keyboard input error: {e}")
+                break
 
     def send_to_arduino_callback(self, msg):
         """Triggered when a message is published to /arduino_tx"""

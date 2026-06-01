@@ -25,7 +25,7 @@ VOICE_MAP = {
 }
 
 SAMPLE_RATE = 16000
-CHUNK       = 4000          # ~250 ms of audio per chunk
+CHUNK       = 1600          # Reduced to ~100 ms of audio per chunk for lower latency
 
 
 class VoiceNode(Node):
@@ -57,6 +57,9 @@ class VoiceNode(Node):
         # ── Publisher ─────────────────────────────────────────────────────
         self.pub = self.create_publisher(String, '/voice/command', 10)
 
+        # ── Listen to gesture commands to clear voice state on gesture stop 
+        self.create_subscription(String, '/gesture/command', self._on_gesture_cmd, 10)
+
         # ── Wake state (from command_arbiter_node) ─────────────────────
         self.standalone = self.declare_parameter('standalone', False).value
         if self.standalone:
@@ -75,6 +78,7 @@ class VoiceNode(Node):
 
         # ── Active Command for Continuous Streaming ───────────────────────
         self.active_command = None
+        self.last_logged_command = None  # dedup INFO logs
         self.create_timer(0.1, self._publish_active_command)
 
         # ── Audio queue + background capture thread ────────────────────────
@@ -93,6 +97,16 @@ class VoiceNode(Node):
             self.get_logger().info('Voice node ACTIVE — listening for commands')
         elif not self.is_awake and prev:
             self.get_logger().info('Voice node SLEEPING — waiting for wake word')
+
+    # ── Gesture command callback ─────────────────────────────────────────
+    def _on_gesture_cmd(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            if data.get('command') == 'stop' and self.active_command is not None:
+                self.active_command = None
+                self.get_logger().info('Voice streaming cleared by gesture "stop"')
+        except json.JSONDecodeError:
+            pass
 
     #log to csv
     def _log_to_csv(self, command, raw_text, inference_time_ms):
@@ -136,21 +150,26 @@ class VoiceNode(Node):
             start_time = time.perf_counter()
             is_accepted = self.recognizer.AcceptWaveform(data)
             end_time = time.perf_counter()
-
-            if not is_accepted:
-                continue    # wait for full utterance
-
             inference_time_ms = round((end_time - start_time) * 1000, 2)
-            result = json.loads(self.recognizer.Result())
-            text   = result.get('text', '').lower().strip()
 
-            if not text:
-                continue
+            # 1. ALWAYS check partial results for zero-latency keyword spotting
+            partial_result = json.loads(self.recognizer.PartialResult())
+            partial_text = partial_result.get('partial', '').lower().strip()
+            
+            if partial_text:
+                matched = self._match_and_update(partial_text, inference_time_ms)
+                if matched:
+                    continue # Skip checking final result if we already fired
 
-            self.get_logger().info(f'Heard: "{text}" | Latency: {inference_time_ms} ms')
-            self._match_and_update(text, inference_time_ms)
+            # 2. Check final results just in case the endpoint triggered
+            if is_accepted:
+                result = json.loads(self.recognizer.Result())
+                text = result.get('text', '').lower().strip()
+                if text:
+                    self._match_and_update(text, inference_time_ms)
 
-    def _match_and_update(self, text: str, inference_time_ms: float):
+    def _match_and_update(self, text: str, inference_time_ms: float) -> bool:
+        """Returns True if a command was matched and executed."""
         # Check multi-word phrases first (e.g. "turn left") then single words
         for phrase in sorted(VOICE_MAP, key=len, reverse=True):
             if phrase in text:
@@ -159,19 +178,36 @@ class VoiceNode(Node):
                 # Gate: wake_word and sleep always pass through;
                 # other commands only when awake
                 if command not in ('wake_word', 'sleep') and not self.is_awake:
-                    self.get_logger().debug(
-                        f'Ignored "{text}" — sleeping (say wake word first)')
-                    return
+                    # Only log debug occasionally so we don't spam the terminal on partials
+                    return False
 
                 # sleep is only meaningful when awake
                 if command == 'sleep' and not self.is_awake:
-                    self.get_logger().debug('Ignored "sleep" — robot already sleeping')
-                    return
+                    return False
 
                 self.active_command = command
-                self._log_to_csv(command, text, inference_time_ms)
-                self.get_logger().info(f'Voice  ["{text}"] → {command}')
-                return  # only fire one command per utterance
+                
+                # INSTANT DISPATCH: Do not wait for the 0.1s publisher timer
+                self._publish_active_command()
+                
+                # One-shot commands: dispatch once then stop streaming.
+                # Only movement commands (forward/backward/left/right) need
+                # continuous streaming to keep the robot moving.
+                if command in ('stop', 'standby', 'wake_word', 'sleep'):
+                    self.active_command = None
+
+                # Only log at INFO when command changes to avoid terminal flooding
+                if command != self.last_logged_command:
+                    self._log_to_csv(command, text, inference_time_ms)
+                    self.get_logger().info(f'Voice  ["{text}"] → {command} | Latency: {inference_time_ms} ms')
+                    self.last_logged_command = command
+                
+                # CRITICAL: Reset the recognizer to clear the partial text buffer. 
+                # This prevents VOSK from repeating the same command on the next chunk.
+                self.recognizer.Reset()
+                return True
+                
+        return False
 
     def _publish_active_command(self):
         if self.active_command:
