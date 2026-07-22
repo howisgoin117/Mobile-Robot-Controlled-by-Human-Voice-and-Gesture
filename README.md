@@ -5,9 +5,9 @@ This repository aims to develop a software stack for a multimodal Autonomous Mob
 
 ## System Architecture
 The software is built on a distributed, asynchronous ROS 2 architecture, divided into three main layers:
-* **Perception Layer:** Independent `gesture_node` and `voice_node` asynchronously process raw camera and microphone streams[cite: 1].
+* **Perception Layer:** Independent `gesture_node` and `voice_node` asynchronously process raw camera and microphone streams.
 * **Decision/Arbitration Layer:** The `command_arbiter_node` acts as the central brain, prioritizing inputs and preventing conflicting kinematic instructions.
-* **Hardware Interface Layer:** Bridges the high-level ROS 2 logic with the low-level AVR microcontrollers via a serial UART node (`avr_serial_node`) to drive the AMR's actuators[cite: 1].
+* **Hardware Interface Layer:** Bridges the high-level ROS 2 logic with the low-level AVR microcontrollers via a serial UART node (`avr_serial_node`) to drive the AMR's actuators.
 
 ## 💻 Tech Stack & Hardware Requirements
 * **Core Framework:** ROS 2 Humble
@@ -62,7 +62,8 @@ Then, execute the script to start the container and launch the ROS 2 nodes:
 ## 📊 Model Performance & Results
 
 ### Gesture Recognition (MediaPipe vs. YOLO)
-An extensive evaluation was conducted comparing MediaPipe and various self-trained YOLO architectures (YOLOv8-Pose, YOLOv11-Pose, YOLO26, YOLO26-Pose) across distances ranging from 0.5m to 3.5m. 
+An extensive evaluation was conducted comparing MediaPipe and various self-trained YOLO architectures using an [open-source hand keypoints dataset provided by YOLO](https://docs.ultralytics.com/datasets/pose/hand-keypoints#introduction)(YOLOv8-Pose, YOLOv11-Pose, YOLO26, YOLO26-Pose) across distances ranging from 0.5m to 3.5m. 
+
 ![Comparison between different YOLO models trained on an open source hand keypoints dataset](images/yolos.png)
 ![MediaPipe model performance](images/MediaPipe.png)
 
