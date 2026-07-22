@@ -63,13 +63,16 @@ Then, execute the script to start the container and launch the ROS 2 nodes:
 
 ### Gesture Recognition (MediaPipe vs. YOLO)
 An extensive evaluation was conducted comparing MediaPipe and various self-trained YOLO architectures (YOLOv8-Pose, YOLOv11-Pose, YOLO26, YOLO26-Pose) across distances ranging from 0.5m to 3.5m. 
+![Comparison between different YOLO models trained on an open source hand keypoints dataset](images/yolos.png)
+![MediaPipe model performance](images/MediaPipe.png)
 
 * **MediaPipe's Superiority:** MediaPipe demonstrated exceptional stability and accuracy, achieving ~90% accuracy and a 78% F1-Score at distances between 0.5m and 1.0m. It maintained a high accuracy of 78%-86% up to 2.0m.
 * **YOLO Limitations:** The YOLO models struggled with the complex kinematic overlapping of hand joints, exhibiting F1-Scores consistently below 20% and failing to reliably detect gestures beyond 2.0 meters.
-* **Latency:** MediaPipe proved to be highly optimized for edge computing, with an average inference latency of ~30.8ms, which is 20-30% faster than the YOLO models (~40-47ms). 
+* **Latency:** MediaPipe proved to be highly optimized for edge computing, with an average inference latency of ~30.8 ms, which is 20-30% faster than the YOLO models (~40- 47 ms). 
 
 ### Voice Recognition (Kaldi/Vosk)
 The offline Keyword Spotting (KWS) system was tested in two environments: low noise (40- 50 dB) and high industrial noise (60- 70 dB).
+![](images/noise_comparision.png)
 
-* **Low Noise:** The model achieved a perfect 100% command accuracy across both standard (OEM) and noise-canceling microphones.
-* **High Noise (60-70dB):** Using a standard OEM microphone, accuracy dropped to 86.7%, with a critical 10% failure rate in recognizing the emergency "STOP" command. However, when paired with a hardware noise-canceling microphone (Edifier W950NB), the Vosk model successfully filtered out background interference and maintained a flawless 100% recognition rate.
+* **Low Noise (40- 50 dB):** The model achieved a perfect 100% command accuracy across both standard (OEM) and noise-canceling microphones.
+* **High Noise (60- 70 dB):** Using a standard OEM microphone, accuracy dropped to 86.7%, with a critical 10% failure rate in recognizing the emergency "STOP" command. However, when paired with a hardware noise-canceling microphone (Edifier W950NB), the Vosk model successfully filtered out background interference and maintained a flawless 100% recognition rate.
